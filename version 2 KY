@@ -1,0 +1,148 @@
+!pip install control
+import numpy as np
+import scipy.integrate as spi
+import control as ct
+import matplotlib.pyplot as plt
+
+# ==========================================
+# 1. PARAMETERS
+# ==========================================
+m = 0.462
+g = 9.81
+phi = np.deg2rad(20)
+k = 15
+b = 1.2
+d = 0.42
+R = 10
+L0, L1, alpha = 0.05, 0.02, 2.5
+delta = 0.6
+c = 0.005
+tau_m = 0.03
+
+m_eff = m + (2/5)*m
+
+# ==========================================
+# 2. EQUILIBRIUM (FIXED SIGN)
+# ==========================================
+x_eq = 0.5
+y_eq = delta - x_eq
+
+# Correct force balance:
+# -c*i^2/(delta-x)^2 + mg sin(phi) - k(x-d) = 0
+i_eq = np.sqrt(((m*g*np.sin(phi) - k*(x_eq - d)) * y_eq**2) / c)
+
+V_eq = R * i_eq
+
+# ==========================================
+# 3. NONLINEAR MODEL (CONSISTENT)
+# ==========================================
+def ball_physics(t, state, V_in):
+    x, v, i, x_m = state
+
+    # Forces (CONSISTENT SIGN)
+    f_grav = m * g * np.sin(phi)
+    f_spr  = -k * (x - d)
+    f_mag  = -c * (i**2) / ((delta - x)**2)
+    f_damp = -b * v
+
+    dx = v
+    dv = (f_grav + f_spr + f_mag + f_damp) / m_eff
+
+    # Electrical
+    L_x = L0 + L1 * np.exp(-alpha * (delta - x))
+    di = (V_in - R * i) / L_x
+
+    # Sensor
+    dx_m = (x - x_m) / tau_m
+
+    return [dx, dv, di, dx_m]
+
+# ==========================================
+# 4. LINEAR MODEL (CORRECT DERIVATIVES)
+# ==========================================
+# Partial derivatives of magnetic force
+dF_dx = (2 * c * i_eq**2) / (y_eq**3)
+dF_di = (-2 * c * i_eq) / (y_eq**2)  # NEGATIVE due to sign
+
+A = np.array([
+    [0, 1, 0, 0],
+    [(dF_dx - k)/m_eff, -b/m_eff, dF_di/m_eff, 0],
+    [0, 0, -R/(L0 + L1*np.exp(-alpha*y_eq)), 0],
+    [1/tau_m, 0, 0, -1/tau_m]
+])
+
+B = np.array([
+    [0],
+    [0],
+    [1/(L0 + L1*np.exp(-alpha*y_eq))],
+    [0]
+])
+
+C = [[0, 0, 0, 1]]   # measured position
+D = [0]
+
+sys_lin = ct.ss(A, B, C, D)
+
+# ==========================================
+# 5. SIMULATION
+# ==========================================
+t = np.linspace(0, 5, 1000)
+
+# SMALL INPUT (valid linearisation)
+dV = 0.05
+
+# Nonlinear
+x0 = [x_eq, 0, i_eq, x_eq]
+sol = spi.solve_ivp(ball_physics, [0, 5], x0,
+                    args=(V_eq + dV,), t_eval=t)
+
+# Linear
+t_lin, y_lin = ct.forced_response(sys_lin, T=t, U=dV)
+
+# ==========================================
+# 6. OPEN-LOOP COMPARISON
+# ==========================================
+plt.figure(figsize=(8,5))
+plt.plot(sol.t, sol.y[0], 'r', label='Nonlinear')
+plt.plot(t_lin, y_lin + x_eq, 'b--', label='Linear')
+
+plt.title('Linear vs Nonlinear (Small Input)')
+plt.xlabel('Time (s)')
+plt.ylabel('Position (m)')
+plt.legend()
+plt.grid()
+plt.show()
+
+# ==========================================
+# 7. PID CONTROLLER
+# ==========================================
+Kp = -250.0  # Stronger push
+Ki = -200.0  # Much stronger pull to the target
+Kd = -40.0   # Solid braking to prevent too much bouncing
+
+PID = ct.parallel(ct.tf([Kp],[1]),
+                  ct.tf([Ki],[1,0]),
+                  ct.tf([Kd,0],[1]))
+
+G = ct.ss2tf(sys_lin)
+sys_cl = ct.feedback(PID * G, 1)
+
+t_pid, y_pid = ct.step_response(sys_cl * 0.02, T=t)
+
+# ==========================================
+# 8. FINAL COMPARISON
+# ==========================================
+plt.figure(figsize=(10,6))
+
+plt.plot(sol.t, sol.y[0], 'r', alpha=0.5, label='Nonlinear Open')
+plt.plot(t_lin, y_lin + x_eq, 'b--', alpha=0.5, label='Linear Open')
+plt.plot(t_pid, y_pid + x_eq, 'g', linewidth=2, label='PID Controlled')
+
+plt.axhline(x_eq + 0.02, linestyle=':', label='Target')
+
+plt.title('Final System Comparison')
+plt.xlabel('Time (s)')
+plt.ylabel('Position (m)')
+plt.legend()
+plt.grid()
+plt.show()
