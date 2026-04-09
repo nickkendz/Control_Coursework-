@@ -1,0 +1,318 @@
+# Pls fix this code 
+# Graphs needed (Impulse response, Step response, Bode plot/Nyquist
+# Don't need nonlinear and linear anymore
+import numpy as np
+import sympy as sp
+import control as ctrl
+import matplotlib.pyplot as plt
+from scipy.integrate import solve_ivp
+from scipy.optimize import fsolve
+
+# ==========================================
+# 1. PARAMETERS
+# ==========================================
+m = 0.462           # kg
+g = 9.81            # m/s^2
+phi = np.deg2rad(41)
+
+d = 0.42            # m, natural spring length position
+delta = 0.65        # m, electromagnet position
+
+R = 2200            # Ohm
+L0 = 0.125          # H
+L1 = 0.0241         # H
+alpha = 1.2         # m^-1
+
+# c = 6.811 m^3*g/(A^2*s^2) -> convert g to kg: c = 6.811e-3 kg*m^3/(A^2*s^2)
+c = 6.811e-3
+
+k = 1885            # N/m
+b = 10.4            # Ns/m
+tau_m = 0.03        # s
+
+# Km (sensor gain) is unknown; assume Km = 1 (dimensionless, position passed through)
+Km = 1.0
+
+# Effective mass: rolling ball (solid sphere) -> I = 2/5 * m * r^2
+# Rolling constraint: m_eff = m + I/r^2 = m*(1 + 2/5) = 1.4*m
+m_eff = 1.4 * m
+
+# ==========================================
+# 2. EQUILIBRIUM SOLVER
+# ==========================================
+def equilibrium_equation(x):
+    y = delta - x
+    if y <= 0:
+        return 1e6
+    # Force balance: gravity along incline = spring + magnetic (with i normalised to 1 for root finding)
+    return m * g * np.sin(phi) - k * (x - d) - (c * 1.0**2) / y**2
+
+#x_eq = fsolve(equilibrium_equation, 0.4)[0]
+x_eq = 0.5  # Setpoint from brief 
+y_eq = delta - x_eq
+
+# Force balance: F_gravity + F_magnetic - F_spring = 0
+# mg*sin(phi) + c*(i^2/y^2) - k*(x - d) = 0
+f_gravity = m * g * np.sin(phi)
+f_spring = k * (x_eq - d)
+
+# Calculate required magnetic force
+f_mag_required = f_spring - f_gravity
+
+if f_mag_required < 0:
+    print("Warning: Spring/Gravity balance pushes ball down; magnet cannot 'push' it back.")
+else:
+    i_eq = np.sqrt(f_mag_required * y_eq**2 / c)
+    V_eq = R * i_eq
+
+L_eq = L0 + L1 * np.exp(-alpha * y_eq)
+
+print("=" * 50)
+print("EQUILIBRIUM POINT")
+print("=" * 50)
+print(f"  x_eq  = {x_eq:.4f} m")
+print(f"  y_eq  = {y_eq:.4f} m  (distance ball to electromagnet)")
+print(f"  i_eq  = {i_eq:.4f} A")
+print(f"  V_eq  = {V_eq:.2f} V")
+print(f"  L_eq  = {L_eq:.5f} H")
+
+# ==========================================
+# 3. SYMBOLIC LINEARISATION
+# ==========================================
+x1, x2, x3, x4, Vin = sp.symbols('x1 x2 x3 x4 Vin')
+
+y_sym = delta - x1
+L_sym = L0 + L1 * sp.exp(-alpha * y_sym)
+
+# State equations:
+#   x1 = ball position x
+#   x2 = ball velocity x_dot
+#   x3 = circuit current i
+#   x4 = sensor output x_m
+f1 = x2
+f2 = (m * g * sp.sin(phi) - k * (x1 - d) - b * x2 + c * x3**2 / y_sym**2) / m_eff
+f3 = (Vin - R * x3) / L_sym
+f4 = (Km * x1 - x4) / tau_m   # sensor: first-order with gain Km=1
+
+F = sp.Matrix([f1, f2, f3, f4])
+
+A_sym = F.jacobian([x1, x2, x3, x4])
+B_sym = F.jacobian([Vin])
+
+subs = {
+    x1: x_eq,
+    x2: 0,
+    x3: i_eq,
+    x4: Km * x_eq,   # sensor steady state: x4 = Km * x1
+    Vin: V_eq
+}
+
+A = np.array(A_sym.subs(subs)).astype(float)
+B = np.array(B_sym.subs(subs)).astype(float)
+# Output is sensor measurement x4; C selects x4 (index 3)
+C = np.array([[0, 0, 0, 1]])
+D = np.array([[0]])
+
+sys_ss = ctrl.ss(A, B, C, D)
+
+print("\n" + "=" * 50)
+print("STATE-SPACE MATRICES")
+print("=" * 50)
+print("A =\n", np.round(A, 4))
+print("B =\n", np.round(B, 4))
+
+# ==========================================
+# 4. TRANSFER FUNCTION
+# ==========================================
+G = ctrl.ss2tf(sys_ss)
+print("\n" + "=" * 50)
+print("PLANT TRANSFER FUNCTION G(s)")
+print("=" * 50)
+print(G)
+
+# ==========================================
+# 5. PID CONTROLLER (REALISABLE)
+# ==========================================
+# Pure derivative Kd*s is improper (not physically realisable).
+# Use a filtered derivative: Kd*s / (tau_f*s + 1)
+# where tau_f is the filter time constant (typically tau_f << 1/bandwidth).
+
+s = ctrl.TransferFunction.s
+
+Kp = 300
+Ki = 200
+Kd = 20
+tau_f = 0.005   # derivative filter time constant (5 ms); chosen << system time constants
+
+# Realisable PID: Kp + Ki/s + Kd*s/(tau_f*s + 1)
+PID = Kp + Ki / s + Kd * s / (tau_f * s + 1)
+
+T_cl = ctrl.feedback(PID * G, 1)
+
+dc = ctrl.dcgain(T_cl)
+print("\n" + "=" * 50)
+print("CLOSED-LOOP")
+print("=" * 50)
+print(f"  DC gain (should be ~1 for zero offset): {dc:.4f}")
+
+# ==========================================
+# 6. STABILITY MARGINS
+# ==========================================
+L_open = PID * G   # open-loop transfer function
+
+try:
+    gm, pm, wgc, wpc = ctrl.margin(L_open)
+    print("\n" + "=" * 50)
+    print("STABILITY MARGINS")
+    print("=" * 50)
+    if gm is not None and not np.isinf(gm):
+        print(f"  Gain margin   = {20*np.log10(gm):.2f} dB  (>6 dB recommended)")
+    else:
+        print("  Gain margin   = Inf (no phase crossover)")
+    if pm is not None:
+        print(f"  Phase margin  = {pm:.2f} deg  (>45 deg recommended)")
+    if wgc is not None:
+        print(f"  Gain crossover freq  = {wgc:.2f} rad/s")
+    if wpc is not None:
+        print(f"  Phase crossover freq = {wpc:.2f} rad/s")
+except Exception as e:
+    print(f"  Could not compute margins: {e}")
+
+# Check closed-loop pole locations
+poles = ctrl.poles(T_cl)
+print("\nClosed-loop poles:")
+for p in poles:
+    print(f"  {p:.4f}  ({'stable' if p.real < 0 else 'UNSTABLE'})")
+
+# ==========================================
+# 7. LINEAR STEP RESPONSE
+# ==========================================
+t = np.linspace(0, 2, 1000)
+t_lin, y_lin = ctrl.step_response(T_cl * 0.01, T=t)
+
+# ==========================================
+# 8. NONLINEAR MODEL
+# ==========================================
+def nonlinear(t, z, u):
+    x, xd, i, xm = z
+    y = delta - x
+
+    if y <= 0:
+        y = 1e-6   # prevent division by zero (physical limit)
+
+    L_val = L0 + L1 * np.exp(-alpha * y)
+    f_mag = c * i**2 / y**2
+
+    xdd = (m * g * np.sin(phi) - k * (x - d) - b * xd - f_mag) / m_eff
+    di  = (u - R * i) / L_val
+    dxm = (Km * x - xm) / tau_m
+
+    return [xd, xdd, di, dxm]
+
+
+# Maximum voltage: limited to ~3x equilibrium to avoid actuator saturation
+# (coil rated voltage not specified; 3*V_eq is a practical engineering bound)
+V_max = max(24.0, 3.0 * V_eq)
+V_min = 0.0   # voltage cannot be negative (diode-protected coil)
+
+# PID state for closed-loop simulations
+def pid_output(error, e_int, e_prev, dt):
+    """Filtered derivative PID output."""
+    de = (error - e_prev) / dt if dt > 0 else 0.0
+    return Kp * error + Ki * e_int + Kd * de / (tau_f + dt)
+
+
+# ==========================================
+# 9. NONLINEAR STEP RESPONSE (1 cm setpoint change)
+# ==========================================
+x_sp = x_eq + 0.01   # 1 cm step
+
+def closed_loop(t, z_aug):
+    z     = z_aug[:4]
+    e_int = z_aug[4]
+
+    error = x_sp - z[3]   # error on sensor output
+    u = V_eq + Kp * error + Ki * e_int
+    u = np.clip(u, V_min, V_max)
+
+    dz = nonlinear(t, z, u)
+    return dz + [error]
+
+
+z0 = [x_eq, 0.0, i_eq, Km * x_eq, 0.0]
+sol = solve_ivp(closed_loop, [0, 2], z0, t_eval=t, max_step=1e-3)
+
+# ==========================================
+# 10. NONLINEAR DISTURBANCE REJECTION
+# ==========================================
+def disturbance_sim(t, z_aug):
+    z     = z_aug[:4]
+    e_int = z_aug[4]
+
+    error = x_eq - z[3]   # regulate back to x_eq
+    u = V_eq + Kp * error + Ki * e_int
+    u = np.clip(u, V_min, V_max)
+
+    dz = list(nonlinear(t, z, u))   # copy to avoid mutation
+
+    # Apply 5 N disturbance force after t = 0.5 s (step in acceleration)
+    if t > 0.5:
+        dz[1] += 5.0 / m_eff
+
+    return dz + [error]
+
+
+z0_d = [x_eq, 0.0, i_eq, Km * x_eq, 0.0]
+sol_d = solve_ivp(disturbance_sim, [0, 2], z0_d, t_eval=t, max_step=1e-3)
+
+# ==========================================
+# 11. PLOTS
+# ==========================================
+fig, axes = plt.subplots(4, 1, figsize=(10, 12))
+
+# --- Step response ---
+ax = axes[0]
+ax.plot(t_lin, y_lin + x_eq, label="Linear model")
+ax.plot(sol.t, sol.y[3], '--', label="Nonlinear model")
+ax.axhline(x_sp, color='gray', linestyle=':', label="Setpoint")
+ax.set_title("Step Response (1 cm setpoint change)")
+ax.set_ylabel("Position (m)")
+ax.legend()
+ax.grid(True)
+
+# --- Impulse response ---
+ax = axes[1]
+t_imp, y_imp = ct.impulse_response(T_cl, T=t)
+ax.plot(t_imp, y_imp)
+ax.set_title("Impulse Response (linearised system)")
+ax.set_ylabel("Position (m)")
+ax.grid(True)
+
+# --- Disturbance rejection ---
+ax = axes[2]
+ax.plot(sol_d.t, sol_d.y[3], label="Ball position (sensor)")
+ax.axhline(x_eq, linestyle='--', color='gray', label="Setpoint x_eq")
+ax.axvline(0.5, linestyle=':', color='red', alpha=0.6, label="Disturbance onset")
+ax.set_title("Disturbance Rejection (5 N step force at t=0.5 s)")
+ax.set_ylabel("Position (m)")
+ax.legend()
+ax.grid(True)
+
+# --- Bode plot of open-loop ---
+ax = axes[3]
+omega = np.logspace(-1, 4, 500)
+try:
+    mag, phase, omega_out = ct.bode(L_open, omega=omega, plot=False)
+    ax.semilogx(omega_out, 20 * np.log10(mag))
+    ax.axhline(0, color='gray', linestyle='--', linewidth=0.8)
+    ax.set_title("Bode Magnitude — Open Loop L(s) = PID · G(s)")
+    ax.set_ylabel("Magnitude (dB)")
+    ax.set_xlabel("Frequency (rad/s)")
+    ax.grid(True, which='both')
+except Exception as e:
+    ax.text(0.5, 0.5, f"Bode plot error: {e}", transform=ax.transAxes, ha='center')
+
+plt.tight_layout()
+plt.savefig("/mnt/user-data/outputs/control_plots.png", dpi=150)
+plt.show()
+print("\nPlots saved to control_plots.png")
