@@ -1,6 +1,6 @@
 # Pls fix this code 
 # Graphs needed (Impulse response, Step response, Bode plot/Nyquist
-# Don't need nonlinear and linear anymore
+
 import numpy as np
 import sympy as sp
 import control as ctrl
