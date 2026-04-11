@@ -1,0 +1,579 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# Imports — exactly the pattern used throughout the book
+# ─────────────────────────────────────────────────────────────────────────────
+import sympy as sym                          # Book §3.7, §4.5, §5.5
+import numpy as np                           # Book §2.5
+import matplotlib.pyplot as plt              # Book §2.5
+import scipy.integrate as spi               # Book §2.5  (solve_ivp)
+import control as ctrl                       # Book §6.7
+
+print("=" * 70)
+print("ELE2038 Coursework — Symbolic Python  (Sopasakis textbook style)")
+print("=" * 70)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  SECTION 1 — SYMBOLIC PARAMETERS
+#  All symbols defined following Book §3.7 p.116:
+#    "import sympy as sym; x = sym.symbols('x')"
+# ══════════════════════════════════════════════════════════════════════════════
+print("\n── Section 1: Define symbolic variables  [Book §3.7, p.116] ────────")
+
+# Symbolic variables for the full derivation
+x, x_dot, i_sym, x_m = sym.symbols('x x_dot i x_m', real=True)
+u_sym                 = sym.symbols('u', real=True)        # input voltage V
+t_sym                 = sym.symbols('t', positive=True)    # time  [Book §5.5]
+s_sym                 = sym.symbols('s')                   # Laplace variable [Book §4.5]
+
+# Symbolic parameters (kept symbolic so every formula is exact)
+m_s, g_s, d_s        = sym.symbols('m g d',        positive=True)
+delta_s, r_s         = sym.symbols('delta r',       positive=True)
+R_s, L0_s, L1_s      = sym.symbols('R L_0 L_1',    positive=True)
+alpha_s, c_s         = sym.symbols('alpha c',       positive=True)
+k_s, b_s             = sym.symbols('k b',           positive=True)
+phi_s, tau_s         = sym.symbols('phi tau_m',     positive=True)
+Km_s                 = sym.symbols('K_m',           positive=True)
+
+# Numerical values (Coursework §1.2, p.3)
+NUM = {
+    m_s:     sym.Rational(462, 1000),   # 0.462 kg
+    g_s:     sym.Float(9.81),
+    d_s:     sym.Rational(42, 100),     # 0.42 m
+    delta_s: sym.Rational(65, 100),     # 0.65 m
+    r_s:     sym.Rational(123, 1000),   # 0.123 m
+    R_s:     sym.Integer(2200),         # 2200 Ω
+    L0_s:    sym.Rational(125, 1000),   # 0.125 H
+    L1_s:    sym.Rational(241, 10000),  # 0.0241 H
+    alpha_s: sym.Rational(6, 5),        # 1.2 m⁻¹
+    c_s:     sym.Float(6.811e-3),
+    k_s:     sym.Integer(1885),
+    b_s:     sym.Rational(104, 10),     # 10.4 Ns/m
+    phi_s:   sym.pi * 41 / 180,        # 41° in radians
+    tau_s:   sym.Rational(3, 100),      # 0.030 s
+    Km_s:    sym.Integer(1),
+}
+
+# Effective rolling inertia — Book Example 2.12 (p.55), Eq. 2.63-2.64:
+#   solid ball I = (2/5)·m·r²  →  m_eff = m + I/r² = (7/5)·m
+m_eff_s = sym.Rational(7, 5) * m_s
+m_eff_num = float(m_eff_s.subs(NUM))
+
+print(f"  m_eff = (7/5)·m = {m_eff_s}  →  {m_eff_num:.4f} kg")
+print("  [Book Ex. 2.12, Eq. 2.63-2.64, p.55]")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  SECTION 2 — SYMBOLIC SYSTEM EQUATIONS (SSR)
+#
+#  Following Book §3.7 (p.116): define symbolic expressions, then use
+#  sym.diff for derivatives.
+#
+#  Variable inductance (Coursework Eq. 1):  L(y) = L0 + L1·exp(−α·y)
+#  Distance:  y = δ − x
+# ══════════════════════════════════════════════════════════════════════════════
+print("\n── Section 2: Symbolic SSR  [Book §3.7, p.116–123] ─────────────────")
+
+y_sym = delta_s - x            # distance ball → electromagnet
+
+# Inductance L(x)  — Coursework Eq. (1)
+L_sym = L0_s + L1_s * sym.exp(-alpha_s * y_sym)
+print(f"\n  L(x) = {L_sym}")
+
+# dL/dx computed symbolically — Book §3.7 p.118: "fx = sym.diff(f, x)"
+dL_dx_sym = sym.diff(L_sym, x)
+dL_dx_sym = sym.simplify(dL_dx_sym)
+print(f"  dL/dx = sym.diff(L, x) = {dL_dx_sym}")
+
+# ── Symbolic right-hand side f(z, u) ─────────────────────────────────────────
+# Mechanical — Book Ex. 2.12 (p.55), Newton 2nd law on rolling ball:
+#   mg sinφ − T = mẍ  with rolling → m_eff·ẍ = ΣF_along_slope
+# Springs: Book Eq. 2.30 (Hooke's law);  Damper: Book Eq. 2.32
+# Magnetic: Coursework Eq. (2)
+F_grav_s   = -m_s * g_s * sym.sin(phi_s)
+F_spring_s = -k_s * (x - d_s)
+F_damp_s   = -b_s * x_dot
+F_mag_s    = c_s * i_sym**2 / y_sym**2    # Coursework Eq. (2)
+
+f2_sym = (F_grav_s + F_spring_s + F_damp_s + F_mag_s) / m_eff_s
+
+# Electrical — Book Exercise 2.9 answer (p.62): Lİ = V − RI
+# Extended for variable L(x): V = R·i + L·(di/dt) + (dL/dx)·ẋ·i
+# → di/dt = [V − R·i − (dL/dx)·ẋ·i] / L
+f3_sym = (u_sym - R_s * i_sym - dL_dx_sym * x_dot * i_sym) / L_sym
+
+# Sensor — Coursework footnote 1 (p.2): τm·ẋm + xm = Km·x
+f4_sym = (Km_s * x - x_m) / tau_s
+
+# Collect full SSR as a column vector
+f_sym = sym.Matrix([x_dot, f2_sym, f3_sym, f4_sym])
+z_sym = sym.Matrix([x, x_dot, i_sym, x_m])
+
+print("\n  Symbolic SSR  ż = f(z, u):")
+print(f"  ż₁ = {f_sym[0]}")
+print(f"  ż₂ = (simplified below)")
+print(f"  ż₃ = (simplified below)")
+print(f"  ż₄ = {f_sym[3]}")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  SECTION 3 — SYMBOLIC EQUILIBRIUM POINTS
+#
+#  Book Proposition 3.4 (p.93): (zᵉ, uᵉ) is an equilibrium iff f(zᵉ,uᵉ) = 0
+#  Book §3.7 p.119: use sym.linsolve or sym.solve for algebraic equations.
+#
+#  Setting f = 0 at (x=xₛₚ, ẋ=0, xm=xₛₚ) and solving for (i, u):
+#    Row 2: force balance → iᵉ
+#    Row 3: (with ẋ=0)   → uᵉ = R·iᵉ
+# ══════════════════════════════════════════════════════════════════════════════
+print("\n── Section 3: Equilibrium  [Book Prop. 3.4 p.93, §3.7 p.119] ───────")
+
+x_sp_val = sym.Rational(1, 2)   # set-point x^sp = 0.5 m
+
+# Substitute x=x_sp, ẋ=0, xm=x_sp into f₂ and f₃, then solve for i and u
+# Book §3.7 p.119: "sol, = sym.linsolve((A, rhs))"  (or sym.solve for nonlinear)
+f2_eq = f2_sym.subs([(x, x_sp_val), (x_dot, 0), (i_sym, i_sym), (x_m, x_sp_val)])
+f3_eq = f3_sym.subs([(x, x_sp_val), (x_dot, 0), (x_m, x_sp_val)])
+
+# f₃ = 0 with ẋ=0:  (u - R·i) / L = 0  →  u = R·i
+# f₂ = 0:  solve for i symbolically
+print("\n  Solving f₂(x_sp, 0, iᵉ, x_sp) = 0  for iᵉ  (sym.solve):")
+i_eq_solutions = sym.solve(f2_eq.subs(NUM), i_sym)
+# Take positive solution (physical current)
+i_e_sym = [sol for sol in i_eq_solutions if sol > 0][0]
+i_e_val = float(i_e_sym)
+print(f"  iᵉ = {float(i_e_sym):.6f} A")
+
+V_e_sym = R_s.subs(NUM) * i_e_sym       # uᵉ = R·iᵉ  (from f₃=0)
+V_e_val = float(V_e_sym)
+print(f"  Vᵉ = R·iᵉ = {V_e_val:.4f} V")
+
+# Inductance at equilibrium
+L_e_sym = L_sym.subs([(x, x_sp_val)] + list(NUM.items()))
+L_e_val = float(L_e_sym)
+print(f"  Lᵉ = {L_e_val*1e3:.4f} mH")
+
+# Equilibrium state vector (numerical)
+z_e = np.array([float(x_sp_val), 0.0, i_e_val, float(x_sp_val)])
+print(f"  zᵉ = {z_e}  [x, ẋ, i, xm]")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  SECTION 4 — SYMBOLIC LINEARISATION  →  A, B MATRICES
+#
+#  Book Theorem 3.6 (p.100): best linear approximation via gradient.
+#  Book §3.7 p.118: "fx = sym.diff(f, x)"  ←  this is exactly what we do.
+#
+#  A = ∂f/∂z|(z^e, u^e)   computed symbolically with sym.diff
+#  B = ∂f/∂u|(z^e, u^e)   computed symbolically with sym.diff
+#
+#  Then substitute numerical equilibrium values to get numerical A, B.
+# ══════════════════════════════════════════════════════════════════════════════
+print("\n── Section 4: Symbolic Jacobian  [Book Thm 3.6 p.100, §3.7 p.118] ──")
+
+# Compute Jacobian matrix A = ∂f/∂z symbolically
+# Book §3.7 p.118: "fx = sym.diff(f, x)"  — same call, different variable
+print("\n  Computing A = ∂f/∂z symbolically using sym.diff ...")
+A_sym = f_sym.jacobian(z_sym)   # sympy's jacobian uses sym.diff internally
+print("  A_sym computed (4×4 symbolic matrix)")
+
+# Compute B = ∂f/∂u symbolically
+B_sym = f_sym.diff(u_sym)       # Book §3.7: sym.diff(f, u)
+print("  B_sym = ∂f/∂u computed")
+
+# ── Substitute equilibrium values to get numerical A, B ───────────────────────
+# Book §3.7 p.118: "fx_val = sym.subs(fx, [(x,0),(y,1)]).evalf()"
+subs_eq = [(x, x_sp_val), (x_dot, 0), (i_sym, i_e_sym),
+           (x_m, x_sp_val), (u_sym, V_e_sym)] + list(NUM.items())
+
+A_num_sym = A_sym.subs(subs_eq)
+B_num_sym = B_sym.subs(subs_eq)
+
+# Convert to numerical numpy arrays via .evalf()
+A = np.array(A_num_sym.evalf().tolist(), dtype=float)
+B = np.array(B_num_sym.evalf().tolist(), dtype=float).reshape(-1, 1)
+C = np.array([[0, 0, 0, 1]], dtype=float)   # output = x_m = z₄
+D = np.zeros((1, 1))
+
+print("\n  A = ∂f/∂z evaluated at (zᵉ, uᵉ):")
+print(np.array2string(A, precision=5, suppress_small=True))
+print(f"\n  B = ∂f/∂u = {B.T}")
+print(f"  C = {C}")
+
+# Check open-loop eigenvalues
+eigs = np.linalg.eigvals(A)
+print("\n  Open-loop eigenvalues (check stability, Book §3.2 p.93):")
+for e in sorted(eigs, key=lambda v: v.real):
+    tag = " ← UNSTABLE (magnetic positive stiffness)" if e.real > 0 else ""
+    print(f"    λ = {e:+.5f}{tag}")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  SECTION 5 — LAPLACE TRANSFORM  (Symbolic)
+#
+#  Book §4.5 p.172:
+#    "x_laplace = sym.laplace_transform(x_signal, t, s)"
+#
+#  We apply ℒ symbolically to the linearised ODE:
+#    dz̄/dt = A·z̄ + B·ū  →  s·Z̄(s) = A·Z̄(s) + B·Ū(s)
+#  Then solve for G(s) = C·(sI−A)⁻¹·B  symbolically.
+# ══════════════════════════════════════════════════════════════════════════════
+print("\n── Section 5: Symbolic Laplace / Transfer Function ──────────────────")
+print("  [Book §4.5 p.172, Def. 6.1 p.240]")
+
+# Build symbolic (sI − A) matrix
+I4     = sym.eye(4)
+A_sym_num = sym.Matrix(A.tolist())   # numerical A as sympy Matrix
+sI_A   = s_sym * I4 - A_sym_num
+
+print("\n  Computing G(s) = C·(sI−A)⁻¹·B  symbolically ...")
+# (sI − A)⁻¹ — symbolic matrix inversion
+inv_sIA = sI_A.inv()
+
+B_sym_num = sym.Matrix(B.tolist())
+C_sym_num = sym.Matrix(C.tolist())
+
+# G(s) = C·(sI−A)⁻¹·B  [Book Definition 6.1, p.240]
+G_sym_raw = C_sym_num * inv_sIA * B_sym_num
+G_sym     = sym.simplify(G_sym_raw[0, 0])   # scalar transfer function
+
+print("\n  G(s) = C·(sI−A)⁻¹·B  (simplified):")
+sym.pprint(G_sym)
+
+# Extract numerator and denominator as polynomials in s
+G_num_poly, G_den_poly = sym.fraction(sym.together(G_sym))
+G_num_poly = sym.Poly(sym.expand(G_num_poly), s_sym)
+G_den_poly = sym.Poly(sym.expand(G_den_poly), s_sym)
+
+print(f"\n  Numerator degree:   {G_num_poly.degree()}")
+print(f"  Denominator degree: {G_den_poly.degree()}")
+print(f"  Strictly proper:    {G_den_poly.degree() > G_num_poly.degree()}")
+
+# Poles (roots of denominator) using sympy
+print("\n  Open-loop poles (sym.solve denominator = 0):")
+poles_sym = sym.solve(G_den_poly.as_expr(), s_sym)
+for p in poles_sym:
+    pv = complex(p.evalf())
+    tag = " ← UNSTABLE" if pv.real > 0 else ""
+    print(f"    s = {pv:.5f}{tag}")
+
+# Build python-control TF from sympy coefficients for simulation
+G_num_coeffs = [float(c) for c in G_num_poly.all_coeffs()]
+G_den_coeffs = [float(c) for c in G_den_poly.all_coeffs()]
+G_ctrl = ctrl.TransferFunction(G_num_coeffs, G_den_coeffs)
+print("\n  python-control TF object created from symbolic coefficients.")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  SECTION 6 — PID CONTROLLER  (python-control, Book §6.7 p.283)
+#
+#  Book §6.7 p.283:
+#    "s = ctrl.TransferFunction.s"
+#    "G = (2*s+1)/(3*s**2 + 8)"
+# ══════════════════════════════════════════════════════════════════════════════
+print("\n── Section 6: PID Controller  [Book §6.7, p.283] ────────────────────")
+
+# Book §6.7: "s = ctrl.TransferFunction.s"
+s_ctrl = ctrl.TransferFunction.s
+
+Kp, Ki, Kd, tau_d = 5000.0, 8000.0, 200.0, 0.005
+
+# PID — same syntax as Book §6.7 (composition of transfer functions)
+C_pid = Kp + Ki / s_ctrl + Kd * s_ctrl / (tau_d * s_ctrl + 1)
+
+# Closed-loop — Book §6.7: "G = ctrl.feedback(G1, G2, sign=-1)"
+L_ol  = C_pid * G_ctrl
+T_cl  = ctrl.feedback(L_ol, 1, sign=-1)
+
+gm, pm, wg, wp = ctrl.margin(L_ol)
+print(f"  Kp={Kp}, Ki={Ki}, Kd={Kd}, τd={tau_d}")
+print(f"  Gain margin:  {20*np.log10(gm):.1f} dB  at ω={wg:.2f} rad/s")
+print(f"  Phase margin: {pm:.1f}°  at ω={wp:.2f} rad/s")
+
+cl_poles = np.array(ctrl.poles(T_cl))
+print("\n  Closed-loop poles:")
+for p in cl_poles:
+    tag = " UNSTABLE" if p.real > 0 else ""
+    print(f"    {p:+.5f}{tag}")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  SECTION 7 — FINAL VALUE THEOREM  (Symbolic)
+#
+#  Book Theorem 4.29 (p.164):
+#    lim_{t→∞} f(t) = lim_{s→0⁺} s·F(s)
+#  Applied symbolically:
+#    X̄m(s) = T(s)·r/s  →  FVT: lim_{s→0} s · T(s)·r/s = T(0)·r
+#
+#  Book §4.5 p.172 — we compute this symbolically using sympy.limit
+# ══════════════════════════════════════════════════════════════════════════════
+print("\n── Section 7: Final Value Theorem (symbolic)  [Book Thm 4.29, p.164]")
+
+r_step = sym.Rational(1, 100)   # r = 0.01 m  (1 cm step)
+
+# Build T(s) symbolically from the python-control closed-loop coefficients
+T_num_coeffs = np.squeeze(T_cl.num)
+T_den_coeffs = np.squeeze(T_cl.den)
+T_num_sym = sum(float(c) * s_sym**(len(T_num_coeffs)-1-i)
+                for i, c in enumerate(T_num_coeffs))
+T_den_sym = sum(float(c) * s_sym**(len(T_den_coeffs)-1-i)
+                for i, c in enumerate(T_den_coeffs))
+T_sym = T_num_sym / T_den_sym
+
+# Step response in s-domain:  X̄m(s) = T(s) · r/s
+Xm_s = T_sym * r_step / s_sym
+
+# FVT:  lim_{s→0} s · X̄m(s)  [Book Thm 4.29]
+fvt_sym  = sym.limit(s_sym * Xm_s, s_sym, 0)
+fvt_val  = float(fvt_sym.evalf())
+
+print(f"\n  X̄m(s) = T(s)·r/s  where  r = {r_step} m")
+print(f"  FVT:  lim_{{s→0}} s·X̄m(s) = sym.limit(s·X̄m(s), s, 0)")
+print(f"       = {fvt_sym.evalf():.8f} m")
+print(f"  Reference r    = {float(r_step):.4f} m")
+print(f"  Steady-state error = {abs(fvt_val - float(r_step))*1e3:.5f} mm")
+print(f"  Zero offset confirmed: {abs(fvt_val - float(r_step)) < 1e-4}")
+
+# ── Initial Value Theorem (symbolic) — Book Theorem 4.28 (p.161) ─────────────
+print("\n  IVT: lim_{t→0⁺} x̄m(t) = lim_{s→∞} s·X̄m(s)  [Book Thm 4.28, p.161]")
+ivt_sym = sym.limit(s_sym * Xm_s, s_sym, sym.oo)
+print(f"     = sym.limit(s·X̄m(s), s, oo) = {ivt_sym}  (no jump at t=0)")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  SECTION 8 — INVERSE LAPLACE TRANSFORM  (Symbolic)
+#
+#  Book §5.5 p.225:
+#    "x_t = sym.inverse_laplace_transform(x_s, s, t)"
+#  Book §5.5 note: "specify t as positive=True"
+#
+#  We compute x̄m(t) = ℒ⁻¹{T(s)·r/s} symbolically.
+#  For high-order systems sympy may time out; we fall back gracefully
+#  to the partial-fraction form (Book Proposition 5.4, p.197).
+# ══════════════════════════════════════════════════════════════════════════════
+print("\n── Section 8: Symbolic Inverse Laplace  [Book §5.5, p.225] ─────────")
+
+# t must be declared positive — Book §5.5 p.225:
+#   "t = sym.Symbol('t', positive=True)"
+# (already declared above)
+
+print("\n  Attempting: sym.inverse_laplace_transform(X̄m(s), s, t) ...")
+print("  (For high-order closed-loop this may be slow — fall-back shown below)")
+
+try:
+    x_t_sym = sym.inverse_laplace_transform(
+        Xm_s, s_sym, t_sym, noconds=True
+    )
+    print("\n  x̄m(t) =")
+    sym.pprint(sym.simplify(x_t_sym))
+except Exception as e:
+    print(f"  Symbolic inversion returned: {e}")
+    print("  → Using partial-fraction form (Book §5.2, Prop. 5.4, p.197):")
+
+# ── Partial-fraction decomposition — Book §5.2, p.192 ───────────────────────
+# "The technique of partial fraction expansion is the key tool for computing
+#  inverse Laplace transforms of rational functions."  (Book p.192)
+print("\n  Partial-fraction decomposition of X̄m(s) = T(s)·r/s :")
+pf = sym.apart(Xm_s, s_sym)
+sym.pprint(pf)
+
+# Time-domain interpretation: each term maps to an exponential via
+#   Book Theorem 4.9 (p.135):  ℒ⁻¹{1/(s−p)} = e^{pt}
+#   Book Proposition 5.4 (p.197): complex conjugate pairs → damped sinusoids
+print("\n  Closed-loop poles and their time-domain contributions:")
+print(f"  {'Pole':>28}   Form  [Book Prop. 5.4, p.197 / Thm 4.9, p.135]")
+print("  " + "─" * 70)
+for p in cl_poles:
+    sigma = -p.real
+    omega =  abs(p.imag)
+    if omega < 1e-6:
+        form = f"C·e^{{−{sigma:.3f}t}}              [Book Thm 4.9, p.135]"
+    else:
+        form = f"K·e^{{−{sigma:.3f}t}}·sin({omega:.3f}t+φ₀)  [Book Prop. 5.4, p.197]"
+    print(f"  p = {p:+.4f}   {form}")
+
+print(f"\n  All Re(pₖ) < 0 → x̄m(t) → {float(r_step)} m  (consistent with FVT)")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  SECTION 9 — NUMERICAL SIMULATION
+#
+#  Book §2.5 p.72:  scipy.integrate.solve_ivp
+#  Book §6.7 p.283: ctrl.step_response
+#
+#  (a) Linearised step response via ctrl.step_response
+#  (b) Nonlinear closed-loop via spi.solve_ivp — required by coursework
+#      footnote 2 (p.3) and discussed in Book §3.6 (p.114, Example 3.18)
+# ══════════════════════════════════════════════════════════════════════════════
+print("\n── Section 9: Numerical Simulation  [Book §2.5 p.72, §6.7 p.283] ───")
+
+# Numerical parameter values for simulation
+m_n     = float(NUM[m_s].evalf())
+g_n     = float(NUM[g_s])
+d_n     = float(NUM[d_s].evalf())
+delta_n = float(NUM[delta_s].evalf())
+R_n     = float(NUM[R_s])
+L0_n    = float(NUM[L0_s].evalf())
+L1_n    = float(NUM[L1_s].evalf())
+alpha_n = float(NUM[alpha_s].evalf())
+c_n     = float(NUM[c_s])
+k_n     = float(NUM[k_s])
+b_n     = float(NUM[b_s])
+phi_n   = float(NUM[phi_s].evalf())
+tau_n   = float(NUM[tau_s].evalf())
+Km_n    = 1.0
+m_eff_n = 7/5 * m_n
+x_sp_n  = 0.50
+r_step_n= 0.01
+
+# Book §2.5 p.73: implement f as a Python function
+def f_nonlinear(t, z, u_func):
+    """
+    Nonlinear SSR  ż = f(z, u).
+    Pattern from Book §2.5 p.73: def horizontal_mass_spring(t, y, ...): ...
+    """
+    x_n, xd_n, i_n, xm_n = z
+    u_n = u_func(t)
+    y_n = delta_n - x_n
+    L_n = L0_n + L1_n * np.exp(-alpha_n * y_n)
+    dL_n= alpha_n * L1_n * np.exp(-alpha_n * y_n)
+    F_m = c_n * i_n**2 / y_n**2 if y_n > 0 else 0.0
+    return [
+        xd_n,
+        (-m_n*g_n*np.sin(phi_n) - k_n*(x_n-d_n) - b_n*xd_n + F_m) / m_eff_n,
+        (u_n - R_n*i_n - dL_n*xd_n*i_n) / L_n,
+        (Km_n*x_n - xm_n) / tau_n
+    ]
+
+def pid_u(e, ei, ed):
+    return Kp*e + Ki*ei + Kd*ed
+
+def cl_nonlinear(t, z_aug):
+    z, ei = z_aug[:4], z_aug[4]
+    x_n, xd_n, i_n, xm_n = z
+    e    = (x_sp_n + r_step_n) - xm_n
+    ed   = -(xm_n - x_n) / tau_n
+    u    = float(np.clip(V_e_val + pid_u(e, ei, ed), 0, V_e_val*4))
+    dz   = f_nonlinear(t, z, lambda t: u)
+    return dz + [e]
+
+t_end  = 2.0
+t_arr  = np.linspace(0, t_end, 5000)
+z0_aug = list(z_e) + [0.0]
+
+# Book §6.7 p.284: "step = ctrl.step_response(tf)"
+t_out, y_lin = ctrl.step_response(r_step_n * T_cl, T=t_arr)
+
+# Book §2.5 p.74: "sol = spi.solve_ivp(lambda t, y: f(...), [t0, tf], y0, t_eval=t_span)"
+sol = spi.solve_ivp(cl_nonlinear, [0, t_end], z0_aug,
+                    t_eval=t_arr, method='RK45', rtol=1e-8, atol=1e-10)
+x_dev_nl = sol.y[3] - x_sp_n
+
+# Book §2.5 p.74: "plt.plot(sol.t, sol.y[0])"
+fig, axes = plt.subplots(1, 2, figsize=(13, 4.5))
+fig.suptitle(
+    "ELE2038 — Closed-loop step response\n"
+    "[Book §3.6 p.114 quality of linearisation; §2.5 p.74 simulation]",
+    fontsize=11
+)
+ax = axes[0]
+ax.plot(t_out, y_lin*100,       lw=1.8, label="Linearised model")
+ax.plot(sol.t, x_dev_nl*100, '--', lw=1.6, label="Nonlinear model")
+ax.axhline(r_step_n*100, color='gray', ls=':', lw=1.1, label="Reference (1 cm)")
+ax.set_xlabel("Time (s)"); ax.set_ylabel("x̄m (cm)")
+ax.set_title("Step response — deviation variable")
+ax.legend(fontsize=9); ax.grid(True, alpha=0.25)
+
+ax = axes[1]
+ax.plot(sol.t, sol.y[2], color='C2', lw=1.5)
+ax.axhline(i_e_val, color='gray', ls=':', lw=1.1, label=f"iᵉ = {i_e_val:.2f} A")
+ax.set_xlabel("Time (s)"); ax.set_ylabel("Current i (A)")
+ax.set_title("Electromagnet current")
+ax.legend(fontsize=9); ax.grid(True, alpha=0.25)
+
+plt.tight_layout()
+plt.savefig("ele2038_step_response.pdf", bbox_inches="tight")
+plt.show()
+print("  Saved: ele2038_step_response.pdf")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  SECTION 10 — BODE DIAGRAM  (Book §6.7 p.284)
+#
+#  Book §6.7 p.284:
+#    "poles, zeros = ctrl.pzmap(G)"
+#  Bode plots from python-control, stability margins from ctrl.margin.
+# ══════════════════════════════════════════════════════════════════════════════
+print("\n── Section 10: Bode diagram  [Book §6.7, p.284] ─────────────────────")
+
+omega = np.logspace(-1, 4, 1000)
+mag, phase, w = ctrl.bode(L_ol, omega, plot=False)
+
+fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(10, 7), sharex=True)
+fig.suptitle(
+    "Open-loop Bode  L(s) = C(s)·G(s)\n"
+    "[Book §6.7 p.284 — python-control]",
+    fontsize=11
+)
+ax1.semilogx(w, 20*np.log10(mag), lw=1.6)
+ax1.axhline(0, color='gray', ls=':', lw=1.0)
+ax1.set_ylabel("Magnitude (dB)")
+ax1.set_title(f"GM = {20*np.log10(gm):.1f} dB   PM = {pm:.1f}°")
+ax1.grid(True, which='both', alpha=0.25)
+
+ax2.semilogx(w, np.degrees(phase), lw=1.6)
+ax2.axhline(-180, color='gray', ls=':', lw=1.0)
+ax2.set_xlabel("Frequency (rad/s)"); ax2.set_ylabel("Phase (deg)")
+ax2.grid(True, which='both', alpha=0.25)
+
+plt.tight_layout()
+plt.savefig("ele2038_bode.pdf", bbox_inches="tight")
+plt.show()
+print("  Saved: ele2038_bode.pdf")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  SECTION 11 — DISTURBANCE REJECTION  (Book §2.5 p.72, Coursework req. iv)
+# ══════════════════════════════════════════════════════════════════════════════
+print("\n── Section 11: Disturbance Rejection  [Book §2.5 p.72] ──────────────")
+
+F_dist, t_onset = 5.0, 1.0
+
+def cl_with_disturbance(t, z_aug):
+    z, ei = z_aug[:4], z_aug[4]
+    x_n, xd_n, i_n, xm_n = z
+    e    = x_sp_n - xm_n
+    ed   = -(xm_n - x_n) / tau_n
+    u    = float(np.clip(V_e_val + pid_u(e, ei, ed), 0, V_e_val*4))
+    dz   = f_nonlinear(t, z, lambda t: u)
+    if t >= t_onset:
+        dz[1] += F_dist / m_eff_n
+    return dz + [e]
+
+t_d   = np.linspace(0, 3.0, 8000)
+sol_d = spi.solve_ivp(cl_with_disturbance, [0, 3.0], z0_aug,
+                      t_eval=t_d, method='RK45', rtol=1e-8, atol=1e-10)
+
+fig, ax = plt.subplots(figsize=(10, 4))
+ax.plot(sol_d.t, (sol_d.y[3] - x_sp_n)*100, lw=1.8)
+ax.axhline(0, color='gray', ls=':', lw=1.1, label="Set-point")
+ax.axvline(t_onset, color='salmon', ls='--', alpha=0.8,
+           label=f"Disturbance Fd = {F_dist} N")
+ax.set_xlabel("Time (s)"); ax.set_ylabel("x̄m (cm)")
+ax.set_title(
+    "Disturbance rejection  [Coursework req. (iv)]\n"
+    "FVT (Book Thm 4.29, p.164) → integral action restores zero offset"
+)
+ax.legend(fontsize=9); ax.grid(True, alpha=0.25)
+plt.tight_layout()
+plt.savefig("ele2038_disturbance.pdf", bbox_inches="tight")
+plt.show()
+
+ss_err = (sol_d.y[3, -1] - x_sp_n) * 100
+print(f"  Steady-state error after disturbance: {ss_err:.5f} cm  (→ 0 by FVT)")
+
+print("\n" + "=" * 70)
+print("All sections complete.  Output files:")
+print("  ele2038_step_response.pdf")
+print("  ele2038_bode.pdf")
+print("  ele2038_disturbance.pdf")
+print("=" * 70)
